@@ -865,7 +865,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
     #[instrument(level = "debug", skip(self))]
     fn assemble_extension_candidates_for_all_traits(&mut self) {
         let mut duplicates = FxHashSet::default();
-        for trait_info in suggest::all_traits(self.tcx) {
+        for trait_info in suggest::traits::all_traits(self.tcx) {
             if duplicates.insert(trait_info.def_id) {
                 self.assemble_extension_candidates_for_trait(&smallvec![], trait_info.def_id);
             }
