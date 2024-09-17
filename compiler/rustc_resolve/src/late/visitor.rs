@@ -1,10 +1,4 @@
-// ignore-tidy-filelength
-//! "Late resolution" is the pass that resolves most of names in a crate beside imports and macros.
-//! It runs when the crate is fully expanded and its module structure is fully built.
-//! So it just walks through the crate and resolves all the expressions, types, etc.
-//!
-//! If you wonder why there's no `early.rs`, that's because it's split into three files -
-//! `build_reduced_graph.rs`, `macros.rs` and `imports.rs`.
+#![allow(unused_imports, unreachable_pub)]
 
 use std::assert_matches::debug_assert_matches;
 use std::borrow::Cow;
@@ -34,671 +28,53 @@ use rustc_span::{BytePos, Span, SyntaxContext};
 use smallvec::{smallvec, SmallVec};
 use tracing::{debug, instrument, trace};
 
+use super::*;
 use crate::{
     errors, path_names_to_string, rustdoc, BindingError, BindingKey, Finalize, LexicalScopeBinding,
     Module, ModuleOrUniformRoot, NameBinding, ParentScope, PathResult, ResolutionError, Resolver,
     Segment, TyCtxt, UseError, Used,
 };
 
-mod diagnostics;
-
-type Res = def::Res<NodeId>;
-
-type IdentMap<T> = FxHashMap<Ident, T>;
-
-use diagnostics::{ElisionFnParameter, LifetimeElisionCandidate, MissingLifetime};
-
-#[derive(Copy, Clone, Debug)]
-struct BindingInfo {
-    span: Span,
-    annotation: BindingMode,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) enum PatternSource {
-    Match,
-    Let,
-    For,
-    FnParam,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum IsRepeatExpr {
-    No,
-    Yes,
-}
-
-struct IsNeverPattern;
-
-/// Describes whether an `AnonConst` is a type level const arg or
-/// some other form of anon const (i.e. inline consts or enum discriminants)
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum AnonConstKind {
-    EnumDiscriminant,
-    InlineConst,
-    ConstArg(IsRepeatExpr),
-}
-
-impl PatternSource {
-    fn descr(self) -> &'static str {
-        match self {
-            PatternSource::Match => "match binding",
-            PatternSource::Let => "let binding",
-            PatternSource::For => "for binding",
-            PatternSource::FnParam => "function parameter",
-        }
-    }
-}
-
-impl IntoDiagArg for PatternSource {
-    fn into_diag_arg(self) -> DiagArgValue {
-        DiagArgValue::Str(Cow::Borrowed(self.descr()))
-    }
-}
-
-/// Denotes whether the context for the set of already bound bindings is a `Product`
-/// or `Or` context. This is used in e.g., `fresh_binding` and `resolve_pattern_inner`.
-/// See those functions for more information.
-#[derive(PartialEq)]
-enum PatBoundCtx {
-    /// A product pattern context, e.g., `Variant(a, b)`.
-    Product,
-    /// An or-pattern context, e.g., `p_0 | ... | p_n`.
-    Or,
-}
-
-/// Does this the item (from the item rib scope) allow generic parameters?
-#[derive(Copy, Clone, Debug)]
-pub(crate) enum HasGenericParams {
-    Yes(Span),
-    No,
-}
-
-/// May this constant have generics?
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ConstantHasGenerics {
-    Yes,
-    No(NoConstantGenericsReason),
-}
-
-impl ConstantHasGenerics {
-    fn force_yes_if(self, b: bool) -> Self {
-        if b { Self::Yes } else { self }
-    }
-}
-
-/// Reason for why an anon const is not allowed to reference generic parameters
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum NoConstantGenericsReason {
-    /// Const arguments are only allowed to use generic parameters when:
-    /// - `feature(generic_const_exprs)` is enabled
-    /// or
-    /// - the const argument is a sole const generic parameter, i.e. `foo::<{ N }>()`
-    ///
-    /// If neither of the above are true then this is used as the cause.
-    NonTrivialConstArg,
-    /// Enum discriminants are not allowed to reference generic parameters ever, this
-    /// is used when an anon const is in the following position:
-    ///
-    /// ```rust,compile_fail
-    /// enum Foo<const N: isize> {
-    ///     Variant = { N }, // this anon const is not allowed to use generics
-    /// }
-    /// ```
-    IsEnumDiscriminant,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ConstantItemKind {
-    Const,
-    Static,
-}
-
-impl ConstantItemKind {
-    pub(crate) fn as_str(&self) -> &'static str {
-        match self {
-            Self::Const => "const",
-            Self::Static => "static",
-        }
-    }
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum RecordPartialRes {
-    Yes,
-    No,
-}
-
-/// The rib kind restricts certain accesses,
-/// e.g. to a `Res::Local` of an outer item.
-#[derive(Copy, Clone, Debug)]
-pub(crate) enum RibKind<'ra> {
-    /// No restriction needs to be applied.
-    Normal,
-
-    /// We passed through an impl or trait and are now in one of its
-    /// methods or associated types. Allow references to ty params that impl or trait
-    /// binds. Disallow any other upvars (including other ty params that are
-    /// upvars).
-    AssocItem,
-
-    /// We passed through a function, closure or coroutine signature. Disallow labels.
-    FnOrCoroutine,
-
-    /// We passed through an item scope. Disallow upvars.
-    Item(HasGenericParams, DefKind),
-
-    /// We're in a constant item. Can't refer to dynamic stuff.
-    ///
-    /// The item may reference generic parameters in trivial constant expressions.
-    /// All other constants aren't allowed to use generic params at all.
-    ConstantItem(ConstantHasGenerics, Option<(Ident, ConstantItemKind)>),
-
-    /// We passed through a module.
-    Module(Module<'ra>),
-
-    /// We passed through a `macro_rules!` statement
-    MacroDefinition(DefId),
-
-    /// All bindings in this rib are generic parameters that can't be used
-    /// from the default of a generic parameter because they're not declared
-    /// before said generic parameter. Also see the `visit_generics` override.
-    ForwardGenericParamBan,
-
-    /// We are inside of the type of a const parameter. Can't refer to any
-    /// parameters.
-    ConstParamTy,
-
-    /// We are inside a `sym` inline assembly operand. Can only refer to
-    /// globals.
-    InlineAsmSym,
-}
-
-impl RibKind<'_> {
-    /// Whether this rib kind contains generic parameters, as opposed to local
-    /// variables.
-    pub(crate) fn contains_params(&self) -> bool {
-        match self {
-            RibKind::Normal
-            | RibKind::FnOrCoroutine
-            | RibKind::ConstantItem(..)
-            | RibKind::Module(_)
-            | RibKind::MacroDefinition(_)
-            | RibKind::ConstParamTy
-            | RibKind::InlineAsmSym => false,
-            RibKind::AssocItem | RibKind::Item(..) | RibKind::ForwardGenericParamBan => true,
-        }
-    }
-
-    /// This rib forbids referring to labels defined in upwards ribs.
-    fn is_label_barrier(self) -> bool {
-        match self {
-            RibKind::Normal | RibKind::MacroDefinition(..) => false,
-
-            RibKind::AssocItem
-            | RibKind::FnOrCoroutine
-            | RibKind::Item(..)
-            | RibKind::ConstantItem(..)
-            | RibKind::Module(..)
-            | RibKind::ForwardGenericParamBan
-            | RibKind::ConstParamTy
-            | RibKind::InlineAsmSym => true,
-        }
-    }
-}
-
-/// A single local scope.
-///
-/// A rib represents a scope names can live in. Note that these appear in many places, not just
-/// around braces. At any place where the list of accessible names (of the given namespace)
-/// changes or a new restrictions on the name accessibility are introduced, a new rib is put onto a
-/// stack. This may be, for example, a `let` statement (because it introduces variables), a macro,
-/// etc.
-///
-/// Different [rib kinds](enum@RibKind) are transparent for different names.
-///
-/// The resolution keeps a separate stack of ribs as it traverses the AST for each namespace. When
-/// resolving, the name is looked up from inside out.
-#[derive(Debug)]
-pub(crate) struct Rib<'ra, R = Res> {
-    pub bindings: IdentMap<R>,
-    pub kind: RibKind<'ra>,
-}
-
-impl<'ra, R> Rib<'ra, R> {
-    fn new(kind: RibKind<'ra>) -> Rib<'ra, R> {
-        Rib { bindings: Default::default(), kind }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum LifetimeUseSet {
-    One { use_span: Span, use_ctxt: visit::LifetimeCtxt },
-    Many,
-}
-
-#[derive(Copy, Clone, Debug)]
-enum LifetimeRibKind {
-    // -- Ribs introducing named lifetimes
-    //
-    /// This rib declares generic parameters.
-    /// Only for this kind the `LifetimeRib::bindings` field can be non-empty.
-    Generics { binder: NodeId, span: Span, kind: LifetimeBinderKind },
-
-    // -- Ribs introducing unnamed lifetimes
-    //
-    /// Create a new anonymous lifetime parameter and reference it.
-    ///
-    /// If `report_in_path`, report an error when encountering lifetime elision in a path:
-    /// ```compile_fail
-    /// struct Foo<'a> { x: &'a () }
-    /// async fn foo(x: Foo) {}
-    /// ```
-    ///
-    /// Note: the error should not trigger when the elided lifetime is in a pattern or
-    /// expression-position path:
-    /// ```
-    /// struct Foo<'a> { x: &'a () }
-    /// async fn foo(Foo { x: _ }: Foo<'_>) {}
-    /// ```
-    AnonymousCreateParameter { binder: NodeId, report_in_path: bool },
-
-    /// Replace all anonymous lifetimes by provided lifetime.
-    Elided(LifetimeRes),
-
-    // -- Barrier ribs that stop lifetime lookup, or continue it but produce an error later.
-    //
-    /// Give a hard error when either `&` or `'_` is written. Used to
-    /// rule out things like `where T: Foo<'_>`. Does not imply an
-    /// error on default object bounds (e.g., `Box<dyn Foo>`).
-    AnonymousReportError,
-
-    /// Resolves elided lifetimes to `'static` if there are no other lifetimes in scope,
-    /// otherwise give a warning that the previous behavior of introducing a new early-bound
-    /// lifetime is a bug and will be removed (if `emit_lint` is enabled).
-    StaticIfNoLifetimeInScope { lint_id: NodeId, emit_lint: bool },
-
-    /// Signal we cannot find which should be the anonymous lifetime.
-    ElisionFailure,
-
-    /// This rib forbids usage of generic parameters inside of const parameter types.
-    ///
-    /// While this is desirable to support eventually, it is difficult to do and so is
-    /// currently forbidden. See rust-lang/project-const-generics#28 for more info.
-    ConstParamTy,
-
-    /// Usage of generic parameters is forbidden in various positions for anon consts:
-    /// - const arguments when `generic_const_exprs` is not enabled
-    /// - enum discriminant values
-    ///
-    /// This rib emits an error when a lifetime would resolve to a lifetime parameter.
-    ConcreteAnonConst(NoConstantGenericsReason),
-
-    /// This rib acts as a barrier to forbid reference to lifetimes of a parent item.
-    Item,
-}
-
-#[derive(Copy, Clone, Debug)]
-enum LifetimeBinderKind {
-    BareFnType,
-    PolyTrait,
-    WhereBound,
-    Item,
-    ConstItem,
-    Function,
-    Closure,
-    ImplBlock,
-}
-
-impl LifetimeBinderKind {
-    fn descr(self) -> &'static str {
-        use LifetimeBinderKind::*;
-        match self {
-            BareFnType => "type",
-            PolyTrait => "bound",
-            WhereBound => "bound",
-            Item | ConstItem => "item",
-            ImplBlock => "impl block",
-            Function => "function",
-            Closure => "closure",
-        }
-    }
-}
-
-#[derive(Debug)]
-struct LifetimeRib {
-    kind: LifetimeRibKind,
-    // We need to preserve insertion order for async fns.
-    bindings: FxIndexMap<Ident, (NodeId, LifetimeRes)>,
-}
-
-impl LifetimeRib {
-    fn new(kind: LifetimeRibKind) -> LifetimeRib {
-        LifetimeRib { bindings: Default::default(), kind }
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) enum AliasPossibility {
-    No,
-    Maybe,
-}
-
-#[derive(Copy, Clone, Debug)]
-pub(crate) enum PathSource<'a> {
-    // Type paths `Path`.
-    Type,
-    // Trait paths in bounds or impls.
-    Trait(AliasPossibility),
-    // Expression paths `path`, with optional parent context.
-    Expr(Option<&'a Expr>),
-    // Paths in path patterns `Path`.
-    Pat,
-    // Paths in struct expressions and patterns `Path { .. }`.
-    Struct,
-    // Paths in tuple struct patterns `Path(..)`.
-    TupleStruct(Span, &'a [Span]),
-    // `m::A::B` in `<T as m::A>::B::C`.
-    TraitItem(Namespace),
-    // Paths in delegation item
-    Delegation,
-}
-
-impl<'a> PathSource<'a> {
-    fn namespace(self) -> Namespace {
-        match self {
-            PathSource::Type | PathSource::Trait(_) | PathSource::Struct => TypeNS,
-            PathSource::Expr(..)
-            | PathSource::Pat
-            | PathSource::TupleStruct(..)
-            | PathSource::Delegation => ValueNS,
-            PathSource::TraitItem(ns) => ns,
-        }
-    }
-
-    fn defer_to_typeck(self) -> bool {
-        match self {
-            PathSource::Type
-            | PathSource::Expr(..)
-            | PathSource::Pat
-            | PathSource::Struct
-            | PathSource::TupleStruct(..) => true,
-            PathSource::Trait(_) | PathSource::TraitItem(..) | PathSource::Delegation => false,
-        }
-    }
-
-    fn descr_expected(self) -> &'static str {
-        match &self {
-            PathSource::Type => "type",
-            PathSource::Trait(_) => "trait",
-            PathSource::Pat => "unit struct, unit variant or constant",
-            PathSource::Struct => "struct, variant or union type",
-            PathSource::TupleStruct(..) => "tuple struct or tuple variant",
-            PathSource::TraitItem(ns) => match ns {
-                TypeNS => "associated type",
-                ValueNS => "method or associated constant",
-                MacroNS => bug!("associated macro"),
-            },
-            PathSource::Expr(parent) => match parent.as_ref().map(|p| &p.kind) {
-                // "function" here means "anything callable" rather than `DefKind::Fn`,
-                // this is not precise but usually more helpful than just "value".
-                Some(ExprKind::Call(call_expr, _)) => match &call_expr.kind {
-                    // the case of `::some_crate()`
-                    ExprKind::Path(_, path)
-                        if let [segment, _] = path.segments.as_slice()
-                            && segment.ident.name == kw::PathRoot =>
-                    {
-                        "external crate"
-                    }
-                    ExprKind::Path(_, path) => {
-                        let mut msg = "function";
-                        if let Some(segment) = path.segments.iter().last() {
-                            if let Some(c) = segment.ident.to_string().chars().next() {
-                                if c.is_uppercase() {
-                                    msg = "function, tuple struct or tuple variant";
-                                }
-                            }
-                        }
-                        msg
-                    }
-                    _ => "function",
-                },
-                _ => "value",
-            },
-            PathSource::Delegation => "function",
-        }
-    }
-
-    fn is_call(self) -> bool {
-        matches!(self, PathSource::Expr(Some(&Expr { kind: ExprKind::Call(..), .. })))
-    }
-
-    pub(crate) fn is_expected(self, res: Res) -> bool {
-        match self {
-            PathSource::Type => matches!(
-                res,
-                Res::Def(
-                    DefKind::Struct
-                        | DefKind::Union
-                        | DefKind::Enum
-                        | DefKind::Trait
-                        | DefKind::TraitAlias
-                        | DefKind::TyAlias
-                        | DefKind::AssocTy
-                        | DefKind::TyParam
-                        | DefKind::OpaqueTy
-                        | DefKind::ForeignTy,
-                    _,
-                ) | Res::PrimTy(..)
-                    | Res::SelfTyParam { .. }
-                    | Res::SelfTyAlias { .. }
-            ),
-            PathSource::Trait(AliasPossibility::No) => matches!(res, Res::Def(DefKind::Trait, _)),
-            PathSource::Trait(AliasPossibility::Maybe) => {
-                matches!(res, Res::Def(DefKind::Trait | DefKind::TraitAlias, _))
-            }
-            PathSource::Expr(..) => matches!(
-                res,
-                Res::Def(
-                    DefKind::Ctor(_, CtorKind::Const | CtorKind::Fn)
-                        | DefKind::Const
-                        | DefKind::Static { .. }
-                        | DefKind::Fn
-                        | DefKind::AssocFn
-                        | DefKind::AssocConst
-                        | DefKind::ConstParam,
-                    _,
-                ) | Res::Local(..)
-                    | Res::SelfCtor(..)
-            ),
-            PathSource::Pat => {
-                res.expected_in_unit_struct_pat()
-                    || matches!(res, Res::Def(DefKind::Const | DefKind::AssocConst, _))
-            }
-            PathSource::TupleStruct(..) => res.expected_in_tuple_struct_pat(),
-            PathSource::Struct => matches!(
-                res,
-                Res::Def(
-                    DefKind::Struct
-                        | DefKind::Union
-                        | DefKind::Variant
-                        | DefKind::TyAlias
-                        | DefKind::AssocTy,
-                    _,
-                ) | Res::SelfTyParam { .. }
-                    | Res::SelfTyAlias { .. }
-            ),
-            PathSource::TraitItem(ns) => match res {
-                Res::Def(DefKind::AssocConst | DefKind::AssocFn, _) if ns == ValueNS => true,
-                Res::Def(DefKind::AssocTy, _) if ns == TypeNS => true,
-                _ => false,
-            },
-            PathSource::Delegation => matches!(res, Res::Def(DefKind::Fn | DefKind::AssocFn, _)),
-        }
-    }
-
-    fn error_code(self, has_unexpected_resolution: bool) -> ErrCode {
-        match (self, has_unexpected_resolution) {
-            (PathSource::Trait(_), true) => E0404,
-            (PathSource::Trait(_), false) => E0405,
-            (PathSource::Type, true) => E0573,
-            (PathSource::Type, false) => E0412,
-            (PathSource::Struct, true) => E0574,
-            (PathSource::Struct, false) => E0422,
-            (PathSource::Expr(..), true) | (PathSource::Delegation, true) => E0423,
-            (PathSource::Expr(..), false) | (PathSource::Delegation, false) => E0425,
-            (PathSource::Pat | PathSource::TupleStruct(..), true) => E0532,
-            (PathSource::Pat | PathSource::TupleStruct(..), false) => E0531,
-            (PathSource::TraitItem(..), true) => E0575,
-            (PathSource::TraitItem(..), false) => E0576,
-        }
-    }
-}
-
-/// At this point for most items we can answer whether that item is exported or not,
-/// but some items like impls require type information to determine exported-ness, so we make a
-/// conservative estimate for them (e.g. based on nominal visibility).
-#[derive(Clone, Copy)]
-enum MaybeExported<'a> {
-    Ok(NodeId),
-    Impl(Option<DefId>),
-    ImplItem(Result<DefId, &'a Visibility>),
-    NestedUse(&'a Visibility),
-}
-
-impl MaybeExported<'_> {
-    fn eval(self, r: &Resolver<'_, '_>) -> bool {
-        let def_id = match self {
-            MaybeExported::Ok(node_id) => Some(r.local_def_id(node_id)),
-            MaybeExported::Impl(Some(trait_def_id)) | MaybeExported::ImplItem(Ok(trait_def_id)) => {
-                trait_def_id.as_local()
-            }
-            MaybeExported::Impl(None) => return true,
-            MaybeExported::ImplItem(Err(vis)) | MaybeExported::NestedUse(vis) => {
-                return vis.kind.is_pub();
-            }
-        };
-        def_id.map_or(true, |def_id| r.effective_visibilities.is_exported(def_id))
-    }
-}
-
-/// Used for recording UnnecessaryQualification.
-#[derive(Debug)]
-pub(crate) struct UnnecessaryQualification<'ra> {
-    pub binding: LexicalScopeBinding<'ra>,
-    pub node_id: NodeId,
-    pub path_span: Span,
-    pub removal_span: Span,
-}
-
-#[derive(Default)]
-struct DiagMetadata<'ast> {
-    /// The current trait's associated items' ident, used for diagnostic suggestions.
-    current_trait_assoc_items: Option<&'ast [P<AssocItem>]>,
-
-    /// The current self type if inside an impl (used for better errors).
-    current_self_type: Option<Ty>,
-
-    /// The current self item if inside an ADT (used for better errors).
-    current_self_item: Option<NodeId>,
-
-    /// The current trait (used to suggest).
-    current_item: Option<&'ast Item>,
-
-    /// When processing generic arguments and encountering an unresolved ident not found,
-    /// suggest introducing a type or const param depending on the context.
-    currently_processing_generic_args: bool,
-
-    /// The current enclosing (non-closure) function (used for better errors).
-    current_function: Option<(FnKind<'ast>, Span)>,
-
-    /// A list of labels as of yet unused. Labels will be removed from this map when
-    /// they are used (in a `break` or `continue` statement)
-    unused_labels: FxHashMap<NodeId, Span>,
-
-    /// Only used for better errors on `let x = { foo: bar };`.
-    /// In the case of a parse error with `let x = { foo: bar, };`, this isn't needed, it's only
-    /// needed for cases where this parses as a correct type ascription.
-    current_block_could_be_bare_struct_literal: Option<Span>,
-
-    /// Only used for better errors on `let <pat>: <expr, not type>;`.
-    current_let_binding: Option<(Span, Option<Span>, Option<Span>)>,
-
-    current_pat: Option<&'ast Pat>,
-
-    /// Used to detect possible `if let` written without `let` and to provide structured suggestion.
-    in_if_condition: Option<&'ast Expr>,
-
-    /// Used to detect possible new binding written without `let` and to provide structured suggestion.
-    in_assignment: Option<&'ast Expr>,
-    is_assign_rhs: bool,
-
-    /// If we are setting an associated type in trait impl, is it a non-GAT type?
-    in_non_gat_assoc_type: Option<bool>,
-
-    /// Used to detect possible `.` -> `..` typo when calling methods.
-    in_range: Option<(&'ast Expr, &'ast Expr)>,
-
-    /// If we are currently in a trait object definition. Used to point at the bounds when
-    /// encountering a struct or enum.
-    current_trait_object: Option<&'ast [ast::GenericBound]>,
-
-    /// Given `where <T as Bar>::Baz: String`, suggest `where T: Bar<Baz = String>`.
-    current_where_predicate: Option<&'ast WherePredicate>,
-
-    current_type_path: Option<&'ast Ty>,
-
-    /// The current impl items (used to suggest).
-    current_impl_items: Option<&'ast [P<AssocItem>]>,
-
-    /// When processing impl trait
-    currently_processing_impl_trait: Option<(TraitRef, Ty)>,
-
-    /// Accumulate the errors due to missed lifetime elision,
-    /// and report them all at once for each function.
-    current_elision_failures: Vec<MissingLifetime>,
-}
-
-struct LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
-    r: &'a mut Resolver<'ra, 'tcx>,
+pub(super) struct LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
+    pub r: &'a mut Resolver<'ra, 'tcx>,
 
     /// The module that represents the current item scope.
-    parent_scope: ParentScope<'ra>,
+    pub parent_scope: ParentScope<'ra>,
 
     /// The current set of local scopes for types and values.
-    ribs: PerNS<Vec<Rib<'ra>>>,
+    pub ribs: PerNS<Vec<Rib<'ra>>>,
 
     /// Previous popped `rib`, only used for diagnostic.
-    last_block_rib: Option<Rib<'ra>>,
+    pub last_block_rib: Option<Rib<'ra>>,
 
     /// The current set of local scopes, for labels.
-    label_ribs: Vec<Rib<'ra, NodeId>>,
+    pub label_ribs: Vec<Rib<'ra, NodeId>>,
 
     /// The current set of local scopes for lifetimes.
-    lifetime_ribs: Vec<LifetimeRib>,
+    pub lifetime_ribs: Vec<LifetimeRib>,
 
     /// We are looking for lifetimes in an elision context.
     /// The set contains all the resolutions that we encountered so far.
     /// They will be used to determine the correct lifetime for the fn return type.
     /// The `LifetimeElisionCandidate` is used for diagnostics, to suggest introducing named
     /// lifetimes.
-    lifetime_elision_candidates: Option<Vec<(LifetimeRes, LifetimeElisionCandidate)>>,
+    pub lifetime_elision_candidates: Option<Vec<(LifetimeRes, LifetimeElisionCandidate)>>,
 
     /// The trait that the current context can refer to.
-    current_trait_ref: Option<(Module<'ra>, TraitRef)>,
+    pub current_trait_ref: Option<(Module<'ra>, TraitRef)>,
 
     /// Fields used to add information to diagnostic errors.
-    diag_metadata: Box<DiagMetadata<'ast>>,
+    pub diag_metadata: Box<DiagMetadata<'ast>>,
 
     /// State used to know whether to ignore resolution errors for function bodies.
     ///
     /// In particular, rustdoc uses this to avoid giving errors for `cfg()` items.
     /// In most cases this will be `None`, in which case errors will always be reported.
     /// If it is `true`, then it will be updated when entering a nested function or trait body.
-    in_func_body: bool,
+    pub in_func_body: bool,
 
     /// Count the number of places a lifetime is used.
-    lifetime_uses: FxHashMap<LocalDefId, LifetimeUseSet>,
+    pub lifetime_uses: FxHashMap<LocalDefId, LifetimeUseSet>,
 }
 
 /// Walks the whole crate in DFS order, visiting each item, resolving names as it goes.
@@ -1317,7 +693,9 @@ impl<'ra: 'ast, 'ast, 'tcx> Visitor<'ast> for LateResolutionVisitor<'_, 'ast, 'r
 }
 
 impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
-    fn new(resolver: &'a mut Resolver<'ra, 'tcx>) -> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
+    pub(super) fn new(
+        resolver: &'a mut Resolver<'ra, 'tcx>,
+    ) -> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         // During late resolution we only track the module component of the parent scope,
         // although it may be useful to track other components as well for diagnostics.
         let graph_root = resolver.graph_root;
@@ -1343,7 +721,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         }
     }
 
-    fn maybe_resolve_ident_in_lexical_scope(
+    pub fn maybe_resolve_ident_in_lexical_scope(
         &mut self,
         ident: Ident,
         ns: Namespace,
@@ -1358,7 +736,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         )
     }
 
-    fn resolve_ident_in_lexical_scope(
+    pub fn resolve_ident_in_lexical_scope(
         &mut self,
         ident: Ident,
         ns: Namespace,
@@ -1375,7 +753,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         )
     }
 
-    fn resolve_path(
+    pub fn resolve_path(
         &mut self,
         path: &[Segment],
         opt_ns: Option<Namespace>, // `None` indicates a module path in import
@@ -1411,7 +789,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
     // implementations thus found, for compatibility with old resolve pass.
 
     /// Do some `work` within a new innermost rib of the given `kind` in the given namespace (`ns`).
-    fn with_rib<T>(
+    pub fn with_rib<T>(
         &mut self,
         ns: Namespace,
         kind: RibKind<'ra>,
@@ -1423,7 +801,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         ret
     }
 
-    fn with_scope<T>(&mut self, id: NodeId, f: impl FnOnce(&mut Self) -> T) -> T {
+    pub fn with_scope<T>(&mut self, id: NodeId, f: impl FnOnce(&mut Self) -> T) -> T {
         if let Some(module) = self.r.get_module(self.r.local_def_id(id).to_def_id()) {
             // Move down in the graph.
             let orig_module = replace(&mut self.parent_scope.module, module);
@@ -1439,7 +817,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         }
     }
 
-    fn visit_generic_params(&mut self, params: &'ast [GenericParam], add_self_upper: bool) {
+    pub fn visit_generic_params(&mut self, params: &'ast [GenericParam], add_self_upper: bool) {
         // For type parameter defaults, we have to ban access
         // to following type parameters, as the GenericArgs can only
         // provide previous type parameters as they're built. We
@@ -1537,7 +915,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
     }
 
     #[instrument(level = "debug", skip(self, work))]
-    fn with_lifetime_rib<T>(
+    pub fn with_lifetime_rib<T>(
         &mut self,
         kind: LifetimeRibKind,
         work: impl FnOnce(&mut Self) -> T,
@@ -1551,7 +929,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn resolve_lifetime(&mut self, lifetime: &'ast Lifetime, use_ctxt: visit::LifetimeCtxt) {
+    pub fn resolve_lifetime(&mut self, lifetime: &'ast Lifetime, use_ctxt: visit::LifetimeCtxt) {
         let ident = lifetime.ident;
 
         if ident.name == kw::StaticLifetime {
@@ -1667,7 +1045,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn resolve_anonymous_lifetime(
+    pub fn resolve_anonymous_lifetime(
         &mut self,
         lifetime: &Lifetime,
         id_for_lint: NodeId,
@@ -1802,7 +1180,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn resolve_elided_lifetime(&mut self, anchor_id: NodeId, span: Span) {
+    pub fn resolve_elided_lifetime(&mut self, anchor_id: NodeId, span: Span) {
         let id = self.r.next_node_id();
         let lt = Lifetime { id, ident: Ident::new(kw::UnderscoreLifetime, span) };
 
@@ -1815,7 +1193,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn create_fresh_lifetime(
+    pub fn create_fresh_lifetime(
         &mut self,
         ident: Ident,
         binder: NodeId,
@@ -1839,7 +1217,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn resolve_elided_lifetimes_in_path(
+    pub fn resolve_elided_lifetimes_in_path(
         &mut self,
         partial_res: PartialRes,
         path: &[Segment],
@@ -2042,7 +1420,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn record_lifetime_res(
+    pub fn record_lifetime_res(
         &mut self,
         id: NodeId,
         res: LifetimeRes,
@@ -2104,7 +1482,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn record_lifetime_param(&mut self, id: NodeId, res: LifetimeRes) {
+    pub fn record_lifetime_param(&mut self, id: NodeId, res: LifetimeRes) {
         if let Some(prev_res) = self.r.lifetimes_res_map.insert(id, res) {
             panic!(
                 "lifetime parameter {id:?} resolved multiple times ({prev_res:?} before, {res:?} now)"
@@ -2114,7 +1492,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
 
     /// Perform resolution of a function signature, accounting for lifetime elision.
     #[instrument(level = "debug", skip(self, inputs))]
-    fn resolve_fn_signature(
+    pub fn resolve_fn_signature(
         &mut self,
         fn_id: NodeId,
         has_self: bool,
@@ -2144,7 +1522,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
     /// Resolve inside function parameters and parameter types.
     /// Returns the lifetime for elision in fn return type,
     /// or diagnostic information in case of elision failure.
-    fn resolve_fn_params(
+    pub fn resolve_fn_params(
         &mut self,
         has_self: bool,
         inputs: impl Iterator<Item = (Option<&'ast Pat>, &'ast Ty)>,
@@ -2262,7 +1640,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
     }
 
     /// List all the lifetimes that appear in the provided type.
-    fn find_lifetime_for_self(&self, ty: &'ast Ty) -> Set1<LifetimeRes> {
+    pub fn find_lifetime_for_self(&self, ty: &'ast Ty) -> Set1<LifetimeRes> {
         /// Visits a type to find all the &references, and determines the
         /// set of lifetimes for all of those references where the referent
         /// contains Self.
@@ -2371,7 +1749,10 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
 
     /// Searches the current set of local scopes for labels. Returns the `NodeId` of the resolved
     /// label and reports an error if the label is not found or is unreachable.
-    fn resolve_label(&mut self, mut label: Ident) -> Result<(NodeId, Span), ResolutionError<'ra>> {
+    pub fn resolve_label(
+        &mut self,
+        mut label: Ident,
+    ) -> Result<(NodeId, Span), ResolutionError<'ra>> {
         let mut suggestion = None;
 
         for i in (0..self.label_ribs.len()).rev() {
@@ -2408,7 +1789,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
     }
 
     /// Determine whether or not a label from the `rib_index`th label rib is reachable.
-    fn is_label_valid_from_rib(&self, rib_index: usize) -> bool {
+    pub fn is_label_valid_from_rib(&self, rib_index: usize) -> bool {
         let ribs = &self.label_ribs[rib_index + 1..];
 
         for rib in ribs {
@@ -2420,7 +1801,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         true
     }
 
-    fn resolve_adt(&mut self, item: &'ast Item, generics: &'ast Generics) {
+    pub fn resolve_adt(&mut self, item: &'ast Item, generics: &'ast Generics) {
         debug!("resolve_adt");
         let kind = self.r.local_def_kind(item.id);
         self.with_current_self_item(item, |this| {
@@ -2449,7 +1830,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         });
     }
 
-    fn future_proof_import(&mut self, use_tree: &UseTree) {
+    pub fn future_proof_import(&mut self, use_tree: &UseTree) {
         if let [segment, rest @ ..] = use_tree.prefix.segments.as_slice() {
             let ident = segment.ident;
             if ident.is_path_segment_keyword() || ident.span.is_rust_2015() {
@@ -2489,7 +1870,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         }
     }
 
-    fn resolve_item(&mut self, item: &'ast Item) {
+    pub fn resolve_item(&mut self, item: &'ast Item) {
         let mod_inner_docs =
             matches!(item.kind, ItemKind::Mod(..)) && rustdoc::inner_docs(&item.attrs);
         if !mod_inner_docs && !matches!(item.kind, ItemKind::Impl(..) | ItemKind::Use(..)) {
@@ -2878,13 +2259,13 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         }
     }
 
-    fn with_label_rib(&mut self, kind: RibKind<'ra>, f: impl FnOnce(&mut Self)) {
+    pub fn with_label_rib(&mut self, kind: RibKind<'ra>, f: impl FnOnce(&mut Self)) {
         self.label_ribs.push(Rib::new(kind));
         f(self);
         self.label_ribs.pop();
     }
 
-    fn with_static_rib(&mut self, def_kind: DefKind, f: impl FnOnce(&mut Self)) {
+    pub fn with_static_rib(&mut self, def_kind: DefKind, f: impl FnOnce(&mut Self)) {
         let kind = RibKind::Item(HasGenericParams::No, def_kind);
         self.with_rib(ValueNS, kind, |this| this.with_rib(TypeNS, kind, f))
     }
@@ -2898,7 +2279,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
     // name resolution so that we don't extend the future
     // compat lint to new cases.
     #[instrument(level = "debug", skip(self, f))]
-    fn with_constant_rib(
+    pub fn with_constant_rib(
         &mut self,
         is_repeat: IsRepeatExpr,
         may_use_generics: ConstantHasGenerics,
@@ -2927,7 +2308,11 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         }
     }
 
-    fn with_current_self_type<T>(&mut self, self_type: &Ty, f: impl FnOnce(&mut Self) -> T) -> T {
+    pub fn with_current_self_type<T>(
+        &mut self,
+        self_type: &Ty,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
         // Handle nested impls (inside fn bodies)
         let previous_value =
             replace(&mut self.diag_metadata.current_self_type, Some(self_type.clone()));
@@ -2936,7 +2321,11 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         result
     }
 
-    fn with_current_self_item<T>(&mut self, self_item: &Item, f: impl FnOnce(&mut Self) -> T) -> T {
+    pub fn with_current_self_item<T>(
+        &mut self,
+        self_item: &Item,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
         let previous_value = replace(&mut self.diag_metadata.current_self_item, Some(self_item.id));
         let result = f(self);
         self.diag_metadata.current_self_item = previous_value;
@@ -2944,7 +2333,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
     }
 
     /// When evaluating a `trait` use its associated types' idents for suggestions in E0412.
-    fn resolve_trait_items(&mut self, trait_items: &'ast [P<AssocItem>]) {
+    pub fn resolve_trait_items(&mut self, trait_items: &'ast [P<AssocItem>]) {
         let trait_assoc_items =
             replace(&mut self.diag_metadata.current_trait_assoc_items, Some(trait_items));
 
@@ -3024,7 +2413,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
     }
 
     /// This is called to resolve a trait reference from an `impl` (i.e., `impl Trait for Foo`).
-    fn with_optional_trait_ref<T>(
+    pub fn with_optional_trait_ref<T>(
         &mut self,
         opt_trait_ref: Option<&TraitRef>,
         self_type: &'ast Ty,
@@ -3055,7 +2444,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         result
     }
 
-    fn with_self_rib_ns(&mut self, ns: Namespace, self_res: Res, f: impl FnOnce(&mut Self)) {
+    pub fn with_self_rib_ns(&mut self, ns: Namespace, self_res: Res, f: impl FnOnce(&mut Self)) {
         let mut self_type_rib = Rib::new(RibKind::Normal);
 
         // Plain insert (no renaming, since types are not currently hygienic)
@@ -3065,11 +2454,11 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         self.ribs[ns].pop();
     }
 
-    fn with_self_rib(&mut self, self_res: Res, f: impl FnOnce(&mut Self)) {
+    pub fn with_self_rib(&mut self, self_res: Res, f: impl FnOnce(&mut Self)) {
         self.with_self_rib_ns(TypeNS, self_res, f)
     }
 
-    fn resolve_implementation(
+    pub fn resolve_implementation(
         &mut self,
         attrs: &[ast::Attribute],
         generics: &'ast Generics,
@@ -3151,7 +2540,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         );
     }
 
-    fn resolve_impl_item(
+    pub fn resolve_impl_item(
         &mut self,
         item: &'ast AssocItem,
         seen_trait_items: &mut FxHashMap<DefId, Span>,
@@ -3296,7 +2685,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         }
     }
 
-    fn check_trait_item<F>(
+    pub fn check_trait_item<F>(
         &mut self,
         id: NodeId,
         mut ident: Ident,
@@ -3474,186 +2863,6 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
 
         // Resolve the pattern.
         self.resolve_pattern_top(&local.pat, PatternSource::Let);
-    }
-
-    /// Build a map from pattern identifiers to binding-info's, and check the bindings are
-    /// consistent when encountering or-patterns and never patterns.
-    /// This is done hygienically: this could arise for a macro that expands into an or-pattern
-    /// where one 'x' was from the user and one 'x' came from the macro.
-    ///
-    /// A never pattern by definition indicates an unreachable case. For example, matching on
-    /// `Result<T, &!>` could look like:
-    /// ```rust
-    /// # #![feature(never_type)]
-    /// # #![feature(never_patterns)]
-    /// # fn bar(_x: u32) {}
-    /// let foo: Result<u32, &!> = Ok(0);
-    /// match foo {
-    ///     Ok(x) => bar(x),
-    ///     Err(&!),
-    /// }
-    /// ```
-    /// This extends to product types: `(x, !)` is likewise unreachable. So it doesn't make sense to
-    /// have a binding here, and we tell the user to use `_` instead.
-    fn compute_and_check_binding_map(
-        &mut self,
-        pat: &Pat,
-    ) -> Result<FxIndexMap<Ident, BindingInfo>, IsNeverPattern> {
-        let mut binding_map = FxIndexMap::default();
-        let mut is_never_pat = false;
-
-        pat.walk(&mut |pat| {
-            match pat.kind {
-                PatKind::Ident(annotation, ident, ref sub_pat)
-                    if sub_pat.is_some() || self.is_base_res_local(pat.id) =>
-                {
-                    binding_map.insert(ident, BindingInfo { span: ident.span, annotation });
-                }
-                PatKind::Or(ref ps) => {
-                    // Check the consistency of this or-pattern and
-                    // then add all bindings to the larger map.
-                    match self.compute_and_check_or_pat_binding_map(ps) {
-                        Ok(bm) => binding_map.extend(bm),
-                        Err(IsNeverPattern) => is_never_pat = true,
-                    }
-                    return false;
-                }
-                PatKind::Never => is_never_pat = true,
-                _ => {}
-            }
-
-            true
-        });
-
-        if is_never_pat {
-            for (_, binding) in binding_map {
-                self.report_error(binding.span, ResolutionError::BindingInNeverPattern);
-            }
-            Err(IsNeverPattern)
-        } else {
-            Ok(binding_map)
-        }
-    }
-
-    fn is_base_res_local(&self, nid: NodeId) -> bool {
-        matches!(
-            self.r.partial_res_map.get(&nid).map(|res| res.expect_full_res()),
-            Some(Res::Local(..))
-        )
-    }
-
-    /// Compute the binding map for an or-pattern. Checks that all of the arms in the or-pattern
-    /// have exactly the same set of bindings, with the same binding modes for each.
-    /// Returns the computed binding map and a boolean indicating whether the pattern is a never
-    /// pattern.
-    ///
-    /// A never pattern by definition indicates an unreachable case. For example, destructuring a
-    /// `Result<T, &!>` could look like:
-    /// ```rust
-    /// # #![feature(never_type)]
-    /// # #![feature(never_patterns)]
-    /// # fn foo() -> Result<bool, &'static !> { Ok(true) }
-    /// let (Ok(x) | Err(&!)) = foo();
-    /// # let _ = x;
-    /// ```
-    /// Because the `Err(&!)` branch is never reached, it does not need to have the same bindings as
-    /// the other branches of the or-pattern. So we must ignore never pattern when checking the
-    /// bindings of an or-pattern.
-    /// Moreover, if all the subpatterns are never patterns (e.g. `Ok(!) | Err(!)`), then the
-    /// pattern as a whole counts as a never pattern (since it's definitionallly unreachable).
-    fn compute_and_check_or_pat_binding_map(
-        &mut self,
-        pats: &[P<Pat>],
-    ) -> Result<FxIndexMap<Ident, BindingInfo>, IsNeverPattern> {
-        let mut missing_vars = FxIndexMap::default();
-        let mut inconsistent_vars = FxIndexMap::default();
-
-        // 1) Compute the binding maps of all arms; we must ignore never patterns here.
-        let not_never_pats = pats
-            .iter()
-            .filter_map(|pat| {
-                let binding_map = self.compute_and_check_binding_map(pat).ok()?;
-                Some((binding_map, pat))
-            })
-            .collect::<Vec<_>>();
-
-        // 2) Record any missing bindings or binding mode inconsistencies.
-        for (map_outer, pat_outer) in not_never_pats.iter() {
-            // Check against all arms except for the same pattern which is always self-consistent.
-            let inners = not_never_pats
-                .iter()
-                .filter(|(_, pat)| pat.id != pat_outer.id)
-                .flat_map(|(map, _)| map);
-
-            for (key, binding_inner) in inners {
-                let name = key.name;
-                match map_outer.get(key) {
-                    None => {
-                        // The inner binding is missing in the outer.
-                        let binding_error =
-                            missing_vars.entry(name).or_insert_with(|| BindingError {
-                                name,
-                                origin: BTreeSet::new(),
-                                target: BTreeSet::new(),
-                                could_be_path: name.as_str().starts_with(char::is_uppercase),
-                            });
-                        binding_error.origin.insert(binding_inner.span);
-                        binding_error.target.insert(pat_outer.span);
-                    }
-                    Some(binding_outer) => {
-                        if binding_outer.annotation != binding_inner.annotation {
-                            // The binding modes in the outer and inner bindings differ.
-                            inconsistent_vars
-                                .entry(name)
-                                .or_insert((binding_inner.span, binding_outer.span));
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3) Report all missing variables we found.
-        for (name, mut v) in missing_vars {
-            if inconsistent_vars.contains_key(&name) {
-                v.could_be_path = false;
-            }
-            self.report_error(
-                *v.origin.iter().next().unwrap(),
-                ResolutionError::VariableNotBoundInPattern(v, self.parent_scope),
-            );
-        }
-
-        // 4) Report all inconsistencies in binding modes we found.
-        for (name, v) in inconsistent_vars {
-            self.report_error(v.0, ResolutionError::VariableBoundWithDifferentMode(name, v.1));
-        }
-
-        // 5) Bubble up the final binding map.
-        if not_never_pats.is_empty() {
-            // All the patterns are never patterns, so the whole or-pattern is one too.
-            Err(IsNeverPattern)
-        } else {
-            let mut binding_map = FxIndexMap::default();
-            for (bm, _) in not_never_pats {
-                binding_map.extend(bm);
-            }
-            Ok(binding_map)
-        }
-    }
-
-    /// Check the consistency of bindings wrt or-patterns and never patterns.
-    fn check_consistent_bindings(&mut self, pat: &'ast Pat) {
-        let mut is_or_or_never = false;
-        pat.walk(&mut |pat| match pat.kind {
-            PatKind::Or(..) | PatKind::Never => {
-                is_or_or_never = true;
-                false
-            }
-            _ => true,
-        });
-        if is_or_or_never {
-            let _ = self.compute_and_check_binding_map(pat);
-        }
     }
 
     fn resolve_arm(&mut self, arm: &'ast Arm) {
@@ -4191,13 +3400,13 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         partial_res
     }
 
-    fn self_type_is_available(&mut self) -> bool {
+    pub fn self_type_is_available(&mut self) -> bool {
         let binding = self
             .maybe_resolve_ident_in_lexical_scope(Ident::with_dummy_span(kw::SelfUpper), TypeNS);
         if let Some(LexicalScopeBinding::Res(res)) = binding { res != Res::Err } else { false }
     }
 
-    fn self_value_is_available(&mut self, self_span: Span) -> bool {
+    pub fn self_value_is_available(&mut self, self_span: Span) -> bool {
         let ident = Ident::new(kw::SelfLower, self_span);
         let binding = self.maybe_resolve_ident_in_lexical_scope(ident, ValueNS);
         if let Some(LexicalScopeBinding::Res(res)) = binding { res != Res::Err } else { false }
@@ -4206,7 +3415,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
     /// A wrapper around [`Resolver::report_error`].
     ///
     /// This doesn't emit errors for function bodies if this is rustdoc.
-    fn report_error(&mut self, span: Span, resolution_error: ResolutionError<'ra>) {
+    pub(crate) fn report_error(&mut self, span: Span, resolution_error: ResolutionError<'ra>) {
         if self.should_report_errs() {
             self.r.report_error(span, resolution_error);
         }
@@ -4797,7 +4006,7 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         res
     }
 
-    fn resolve_doc_links(&mut self, attrs: &[Attribute], maybe_exported: MaybeExported<'_>) {
+    pub fn resolve_doc_links(&mut self, attrs: &[Attribute], maybe_exported: MaybeExported<'_>) {
         match self.r.tcx.sess.opts.resolve_doc_links {
             ResolveDocLinks::None => return,
             ResolveDocLinks::ExportedMetadata
@@ -4917,103 +4126,4 @@ impl<'a, 'ast, 'ra: 'ast, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
             });
         }
     }
-}
-
-/// Walks the whole crate in DFS order, visiting each item, counting the declared number of
-/// lifetime generic parameters and function parameters.
-struct ItemInfoCollector<'a, 'ra, 'tcx> {
-    r: &'a mut Resolver<'ra, 'tcx>,
-}
-
-impl ItemInfoCollector<'_, '_, '_> {
-    fn collect_fn_info(&mut self, sig: &FnSig, id: NodeId) {
-        let sig = DelegationFnSig {
-            header: sig.header,
-            param_count: sig.decl.inputs.len(),
-            has_self: sig.decl.has_self(),
-            c_variadic: sig.decl.c_variadic(),
-        };
-        self.r.delegation_fn_sigs.insert(self.r.local_def_id(id), sig);
-    }
-}
-
-impl<'ast> Visitor<'ast> for ItemInfoCollector<'_, '_, '_> {
-    fn visit_item(&mut self, item: &'ast Item) {
-        match &item.kind {
-            ItemKind::TyAlias(box TyAlias { ref generics, .. })
-            | ItemKind::Const(box ConstItem { ref generics, .. })
-            | ItemKind::Fn(box Fn { ref generics, .. })
-            | ItemKind::Enum(_, ref generics)
-            | ItemKind::Struct(_, ref generics)
-            | ItemKind::Union(_, ref generics)
-            | ItemKind::Impl(box Impl { ref generics, .. })
-            | ItemKind::Trait(box Trait { ref generics, .. })
-            | ItemKind::TraitAlias(ref generics, _) => {
-                if let ItemKind::Fn(box Fn { ref sig, .. }) = &item.kind {
-                    self.collect_fn_info(sig, item.id);
-                }
-
-                let def_id = self.r.local_def_id(item.id);
-                let count = generics
-                    .params
-                    .iter()
-                    .filter(|param| matches!(param.kind, ast::GenericParamKind::Lifetime { .. }))
-                    .count();
-                self.r.item_generics_num_lifetimes.insert(def_id, count);
-            }
-
-            ItemKind::Mod(..)
-            | ItemKind::ForeignMod(..)
-            | ItemKind::Static(..)
-            | ItemKind::Use(..)
-            | ItemKind::ExternCrate(..)
-            | ItemKind::MacroDef(..)
-            | ItemKind::GlobalAsm(..)
-            | ItemKind::MacCall(..)
-            | ItemKind::DelegationMac(..) => {}
-            ItemKind::Delegation(..) => {
-                // Delegated functions have lifetimes, their count is not necessarily zero.
-                // But skipping the delegation items here doesn't mean that the count will be considered zero,
-                // it means there will be a panic when retrieving the count,
-                // but for delegation items we are never actually retrieving that count in practice.
-            }
-        }
-        visit::walk_item(self, item)
-    }
-
-    fn visit_assoc_item(&mut self, item: &'ast AssocItem, ctxt: AssocCtxt) {
-        if let AssocItemKind::Fn(box Fn { ref sig, .. }) = &item.kind {
-            self.collect_fn_info(sig, item.id);
-        }
-        visit::walk_assoc_item(self, item, ctxt);
-    }
-}
-
-impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
-    pub(crate) fn late_resolve_crate(&mut self, krate: &Crate) {
-        visit::walk_crate(&mut ItemInfoCollector { r: self }, krate);
-        let mut late_resolution_visitor = LateResolutionVisitor::new(self);
-        late_resolution_visitor.resolve_doc_links(&krate.attrs, MaybeExported::Ok(CRATE_NODE_ID));
-        visit::walk_crate(&mut late_resolution_visitor, krate);
-        for (id, span) in late_resolution_visitor.diag_metadata.unused_labels.iter() {
-            self.lint_buffer.buffer_lint(
-                lint::builtin::UNUSED_LABELS,
-                *id,
-                *span,
-                BuiltinLintDiag::UnusedLabel,
-            );
-        }
-    }
-}
-
-/// Check if definition matches a path
-fn def_id_matches_path(tcx: TyCtxt<'_>, mut def_id: DefId, expected_path: &[&str]) -> bool {
-    let mut path = expected_path.iter().rev();
-    while let (Some(parent), Some(next_step)) = (tcx.opt_parent(def_id), path.next()) {
-        if !tcx.opt_item_name(def_id).map_or(false, |n| n.as_str() == *next_step) {
-            return false;
-        }
-        def_id = parent;
-    }
-    true
 }
