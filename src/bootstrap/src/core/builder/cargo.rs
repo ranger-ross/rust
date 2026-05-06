@@ -600,6 +600,8 @@ impl Builder<'_> {
 
         let mut hostflags = HostFlags::default();
 
+        cargo.arg("-Zbuild-dir-new-layout");
+
         // Codegen backends are not yet tracked by -Zbinary-dep-depinfo,
         // so we need to explicitly clear out if they've been updated.
         for backend in self.codegen_backends(compiler) {

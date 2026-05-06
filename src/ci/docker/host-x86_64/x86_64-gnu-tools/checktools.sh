@@ -6,6 +6,9 @@ set -x # so one can see where we are in the script
 
 X_PY="$1"
 
+# FIXME: Clean this up after the new Cargo build-dir layout is stabilized and fully integrated into rust-lang/rust
+export CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT=true
+
 # Try to test the toolstate-tracked tools and store the build/test success in the TOOLSTATE_FILE.
 
 # Pre-build the compiler and the library first to output a better error message when the build
