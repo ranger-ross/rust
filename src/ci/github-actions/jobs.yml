@@ -2,7 +2,8 @@
 # dynamically in CI from ci.yml.
 runners:
   - &base-job
-    env: { }
+    env:
+      CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT: true
 
   - &job-linux-4c
     os: ubuntu-24.04
