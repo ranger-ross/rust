@@ -366,6 +366,7 @@ pub fn link_binary(
                         &metadata,
                         RlibFlavor::Normal,
                         &path,
+                        outputs,
                     )
                     .build(&out_filename, None);
                 }
@@ -379,6 +380,7 @@ pub fn link_binary(
                         &metadata,
                         &out_filename,
                         &path,
+                        outputs,
                     );
                 }
                 _ => {
@@ -548,6 +550,7 @@ fn link_rlib<'a>(
     metadata: &EncodedMetadata,
     flavor: RlibFlavor,
     tmpdir: &MaybeTempDir,
+    outputs: &OutputFilenames,
 ) -> Box<dyn ArchiveBuilder + 'a> {
     let mut ab = archive_builder_builder.new_archive_builder(sess);
 
@@ -558,9 +561,17 @@ fn link_rlib<'a>(
     let rust_object_files: Vec<String> = compiled_modules
         .modules
         .iter()
-        .filter_map(|m| m.object.as_ref())
-        .chain(compiled_modules.modules.iter().filter_map(|m| m.global_asm_object.as_ref()))
-        .map(|obj| obj.file_name().unwrap().to_str().unwrap().to_string())
+        .flat_map(|m| {
+            // We use random string to prevent collisions in temporary files (see OutputFilenames::invocation_temp)
+            // However we don't want to include those in the rlib file so that it is deterministic
+            // across invocations.
+            [
+                m.object.as_ref().map(|_| outputs.archive_member_name("o", &m.name)),
+                m.global_asm_object.as_ref().map(|_| outputs.archive_member_name("asm.o", &m.name)),
+            ]
+            .into_iter()
+            .flatten()
+        })
         .collect();
 
     let native_lib_filenames: Vec<Option<Symbol>> = crate_info
@@ -569,16 +580,19 @@ fn link_rlib<'a>(
         .map(|lib| find_bundled_library(lib, sess, &crate_info.crate_types))
         .collect();
 
-    let metadata_link_file = if matches!(flavor, RlibFlavor::Normal) {
+    let (metadata_link_file, rust_object_files) = if matches!(flavor, RlibFlavor::Normal) {
         let native_lib_filenames: Vec<Option<String>> =
             native_lib_filenames.iter().map(|f| f.map(|s| s.to_string())).collect();
         let metadata_link = rmeta_link::RmetaLink { rust_object_files, native_lib_filenames };
         let metadata_link_data = metadata_link.encode();
         let (wrapper, _) =
             create_wrapper_file(sess, rmeta_link::SECTION.to_string(), &metadata_link_data);
-        Some(emit_wrapper_file(sess, &wrapper, tmpdir.as_ref(), rmeta_link::FILENAME))
+        (
+            Some(emit_wrapper_file(sess, &wrapper, tmpdir.as_ref(), rmeta_link::FILENAME)),
+            metadata_link.rust_object_files,
+        )
     } else {
-        None
+        (None, rust_object_files)
     };
 
     let trailing_metadata = match flavor {
@@ -608,13 +622,15 @@ fn link_rlib<'a>(
         RlibFlavor::StaticlibBase => None,
     };
 
+    // Consume the encoded names in the same module/object order without copying them.
+    let mut rust_object_files = rust_object_files.into_iter();
     for m in &compiled_modules.modules {
         if let Some(obj) = m.object.as_ref() {
-            ab.add_file(obj, None, ArchiveEntryKind::RustObj);
+            ab.add_file(obj, Some(rust_object_files.next().unwrap()), ArchiveEntryKind::RustObj);
         }
 
         if let Some(obj) = m.global_asm_object.as_ref() {
-            ab.add_file(obj, None, ArchiveEntryKind::RustObj);
+            ab.add_file(obj, Some(rust_object_files.next().unwrap()), ArchiveEntryKind::RustObj);
         }
 
         if let Some(dwarf_obj) = m.dwarf_object.as_ref() {
@@ -627,10 +643,18 @@ fn link_rlib<'a>(
         RlibFlavor::StaticlibBase => {
             if let Some(m) = &compiled_modules.allocator_module {
                 if let Some(obj) = &m.object {
-                    ab.add_file(obj, None, ArchiveEntryKind::RustObj);
+                    ab.add_file(
+                        obj,
+                        Some(outputs.archive_member_name("o", &m.name)),
+                        ArchiveEntryKind::RustObj,
+                    );
                 }
                 if let Some(obj) = &m.global_asm_object {
-                    ab.add_file(obj, None, ArchiveEntryKind::RustObj);
+                    ab.add_file(
+                        obj,
+                        Some(outputs.archive_member_name("asm.o", &m.name)),
+                        ArchiveEntryKind::RustObj,
+                    );
                 }
             }
         }
@@ -758,6 +782,7 @@ fn link_staticlib(
     metadata: &EncodedMetadata,
     out_filename: &Path,
     tempdir: &MaybeTempDir,
+    outputs: &OutputFilenames,
 ) {
     info!("preparing staticlib to {:?}", out_filename);
     let mut ab = link_rlib(
@@ -768,6 +793,7 @@ fn link_staticlib(
         metadata,
         RlibFlavor::StaticlibBase,
         tempdir,
+        outputs,
     );
     let mut all_native_libs = vec![];
 

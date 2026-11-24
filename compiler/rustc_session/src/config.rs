@@ -1087,6 +1087,14 @@ impl OutputFilenames {
         maybe_strip_file_name(self.with_directory_and_extension(temps_directory, &extension))
     }
 
+    pub fn archive_member_name(&self, ext: &str, codegen_unit_name: &str) -> String {
+        let extension = format!("{codegen_unit_name}.{RUST_CGU_EXT}.{ext}");
+        maybe_strip_file_name(self.with_directory_and_extension(Path::new(""), &extension))
+            .into_os_string()
+            .into_string()
+            .unwrap()
+    }
+
     pub fn temp_path_for_diagnostic(&self, ext: &str) -> PathBuf {
         let temps_directory = self.temps_directory.as_ref().unwrap_or(&self.out_directory);
         self.with_directory_and_extension(temps_directory, &ext)
