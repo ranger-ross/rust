@@ -593,11 +593,11 @@ fn link_rlib<'a>(
                     // normal linkers for the platform. Sometimes this is not possible however.
                     // If it is possible however, placing the metadata object first improves
                     // performance of getting metadata from rlibs.
-                    ab.add_file(&metadata, ArchiveEntryKind::Other);
+                    ab.add_file(&metadata, None, ArchiveEntryKind::Other);
                     // Place the rmeta-link member immediately after metadata so consumers
                     // can find it without iterating the whole archive.
                     if let Some(file) = &metadata_link_file {
-                        ab.add_file(file, ArchiveEntryKind::Other);
+                        ab.add_file(file, None, ArchiveEntryKind::Other);
                     }
                     None
                 }
@@ -610,15 +610,15 @@ fn link_rlib<'a>(
 
     for m in &compiled_modules.modules {
         if let Some(obj) = m.object.as_ref() {
-            ab.add_file(obj, ArchiveEntryKind::RustObj);
+            ab.add_file(obj, None, ArchiveEntryKind::RustObj);
         }
 
         if let Some(obj) = m.global_asm_object.as_ref() {
-            ab.add_file(obj, ArchiveEntryKind::RustObj);
+            ab.add_file(obj, None, ArchiveEntryKind::RustObj);
         }
 
         if let Some(dwarf_obj) = m.dwarf_object.as_ref() {
-            ab.add_file(dwarf_obj, ArchiveEntryKind::Other);
+            ab.add_file(dwarf_obj, None, ArchiveEntryKind::Other);
         }
     }
 
@@ -627,10 +627,10 @@ fn link_rlib<'a>(
         RlibFlavor::StaticlibBase => {
             if let Some(m) = &compiled_modules.allocator_module {
                 if let Some(obj) = &m.object {
-                    ab.add_file(obj, ArchiveEntryKind::RustObj);
+                    ab.add_file(obj, None, ArchiveEntryKind::RustObj);
                 }
                 if let Some(obj) = &m.global_asm_object {
-                    ab.add_file(obj, ArchiveEntryKind::RustObj);
+                    ab.add_file(obj, None, ArchiveEntryKind::RustObj);
                 }
             }
         }
@@ -721,18 +721,18 @@ fn link_rlib<'a>(
         //
         // Basically, all this means is that this code should not move above the
         // code above.
-        ab.add_file(&trailing_metadata, ArchiveEntryKind::Other);
+        ab.add_file(&trailing_metadata, None, ArchiveEntryKind::Other);
         // Place the rmeta-link member immediately after metadata so consumers can
         // find it without iterating the whole archive.
         if let Some(file) = &metadata_link_file {
-            ab.add_file(file, ArchiveEntryKind::Other);
+            ab.add_file(file, None, ArchiveEntryKind::Other);
         }
     }
 
     // Add all bundled static native library dependencies.
     // Archives added to the end of .rlib archive, see comment above for the reason.
     for lib in packed_bundled_libs {
-        ab.add_file(&lib, ArchiveEntryKind::Other)
+        ab.add_file(&lib, None, ArchiveEntryKind::Other)
     }
 
     ab
@@ -1637,7 +1637,7 @@ fn link_natively(
 
     if should_archive {
         let mut ab = archive_builder_builder.new_archive_builder(sess);
-        ab.add_file(temp_filename, ArchiveEntryKind::Other);
+        ab.add_file(temp_filename, None, ArchiveEntryKind::Other);
         ab.build(out_filename, None);
     }
 }
